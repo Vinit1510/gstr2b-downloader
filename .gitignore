@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+*.spec.bak
+
+# Application data — never commit
+data/
+GSTR-2B/
+Reports/
+logs/
+sample_clients.xlsx
+# (sample_clients_TEMPLATE.xlsx IS tracked — it's the starter file for users)
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
