@@ -8,19 +8,25 @@
 import os
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_all
 
 block_cipher = None
+
+# ---------------------------------------------------------------------------
+# Pull in setuptools / pkg_resources internals that PyInstaller misses by
+# default (jaraco.text, jaraco.context, backports.tarfile, etc.).
+# Without these, the .exe fails at startup with:
+#   ModuleNotFoundError: No module named 'backports'
+# ---------------------------------------------------------------------------
+_pkgres_datas, _pkgres_binaries, _pkgres_hiddenimports = collect_all("pkg_resources")
+_setup_datas, _setup_binaries, _setup_hiddenimports = collect_all("setuptools")
 
 # ---------------------------------------------------------------------------
 # Resolve Playwright browser path so we can bundle it.
 # ---------------------------------------------------------------------------
 def _playwright_browsers_path() -> str:
-    # When `playwright install chromium` runs (in CI we do this before build),
-    # browsers live under the Playwright registry. We grab that and copy it
-    # into the bundle.
     import playwright
     pkg_dir = Path(playwright.__file__).parent
-    # Default Windows registry path
     candidates = [
         Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")) if os.environ.get("PLAYWRIGHT_BROWSERS_PATH") else None,
         Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright",
@@ -44,9 +50,6 @@ datas = []
 for entry in Path(browsers_path).iterdir():
     datas.append((str(entry), f"ms-playwright/{entry.name}"))
 
-# easyocr ships its own model loader that downloads on first use.
-# We pre-download in CI to avoid runtime internet need.
-
 hiddenimports = [
     "playwright",
     "playwright.sync_api",
@@ -58,18 +61,33 @@ hiddenimports = [
     "PIL.Image",
     "cv2",
     "numpy",
-]
+    # setuptools / pkg_resources tail dependencies (PyInstaller misses these)
+    "pkg_resources",
+    "pkg_resources.extern",
+    "pkg_resources._vendor",
+    "pkg_resources._vendor.jaraco",
+    "pkg_resources._vendor.jaraco.text",
+    "pkg_resources._vendor.jaraco.context",
+    "pkg_resources._vendor.jaraco.functools",
+    "pkg_resources._vendor.backports",
+    "pkg_resources._vendor.backports.tarfile",
+    "jaraco",
+    "jaraco.text",
+    "jaraco.context",
+    "jaraco.functools",
+    "backports",
+    "backports.tarfile",
+] + _pkgres_hiddenimports + _setup_hiddenimports
 
 a = Analysis(
     ["run.py"],
     pathex=[str(Path(SPECPATH))],
-    binaries=[],
-    datas=datas,
+    binaries=_pkgres_binaries + _setup_binaries,
+    datas=datas + _pkgres_datas + _setup_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=["runtime_hook.py"],
     excludes=[
-        # Trim very heavy modules we never use to keep the .exe smaller
         "matplotlib",
         "scipy",
         "tkinter.test",
@@ -96,7 +114,7 @@ exe = EXE(
     upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # GUI app — no console window
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
