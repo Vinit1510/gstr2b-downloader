@@ -15,11 +15,16 @@ block_cipher = None
 # ---------------------------------------------------------------------------
 # Pull in setuptools / pkg_resources internals that PyInstaller misses by
 # default (jaraco.text, jaraco.context, backports.tarfile, etc.).
-# Without these, the .exe fails at startup with:
-#   ModuleNotFoundError: No module named 'backports'
 # ---------------------------------------------------------------------------
 _pkgres_datas, _pkgres_binaries, _pkgres_hiddenimports = collect_all("pkg_resources")
 _setup_datas, _setup_binaries, _setup_hiddenimports = collect_all("setuptools")
+
+# ---------------------------------------------------------------------------
+# Force-collect every module under our own `src` package so the frozen .exe
+# can resolve `from src.xxx import yyy`.  Without this PyInstaller misses
+# `src` because it is found via path rather than installed as a package.
+# ---------------------------------------------------------------------------
+_src_hiddenimports = collect_submodules("src")
 
 # ---------------------------------------------------------------------------
 # Resolve Playwright browser path so we can bundle it.
@@ -77,7 +82,21 @@ hiddenimports = [
     "jaraco.functools",
     "backports",
     "backports.tarfile",
-] + _pkgres_hiddenimports + _setup_hiddenimports
+    # Our own application package
+    "src",
+    "src.main",
+    "src.config",
+    "src.logger",
+    "src.crypto_utils",
+    "src.excel_io",
+    "src.captcha_solver",
+    "src.gst_portal",
+    "src.orchestrator",
+    "src.gui",
+    "src.gui.main_window",
+    "src.gui.master_password",
+    "src.gui.captcha_dialog",
+] + _pkgres_hiddenimports + _setup_hiddenimports + _src_hiddenimports
 
 a = Analysis(
     ["run.py"],
