@@ -183,6 +183,7 @@ def write_report(path: Path, results: Iterable[ClientResult]) -> None:
     status_colors = {
         "Success": "C6EFCE",
         "Already Downloaded": "DDEBF7",
+        "No Data Available": "FFF2CC",
         "Failed Login": "FFC7CE",
         "Wrong Password": "FFC7CE",
         "CAPTCHA Failed": "FFEB9C",

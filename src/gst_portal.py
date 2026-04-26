@@ -3,23 +3,28 @@
 This module is the only place that should know about the portal's HTML.
 If GSTN changes the page, only the constants and helpers here need updating.
 
-The flow:
+Real-world flow (verified from live portal April 2026):
     1. open_login_page()
-    2. fetch_captcha_image() -> bytes
-    3. submit_credentials(user_id, password, captcha_text) -> bool
-    4. navigate_to_returns_dashboard()
-    5. download_gstr2b(year, month, save_dir, filename) -> Path
-
-Each high-level method raises a typed exception on failure so the
-orchestrator can map it to a user-friendly status.
+    2. enter_username(user_id)            -> typing username triggers CAPTCHA load
+    3. fetch_captcha_image() -> bytes
+    4. submit_login(password, captcha_text)
+    5. (auto) handle_post_login()         -> dismisses welcome page if present
+    6. navigate_to_returns_dashboard()    -> goes to return.gst.gov.in
+    7. select_period(year, month)         -> FY + Quarter + Period
+    8. open_gstr2b_view()                 -> click VIEW on GSTR-2B tile
+    9. download_gstr2b_excel(save_path)   -> on summary page click "Download
+                                             GSTR-2B details Excel"; if portal
+                                             says "no data" raise NoDataAvailableError
 """
 from __future__ import annotations
 
 import logging
 import random
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -37,15 +42,34 @@ log = logging.getLogger("gstr2b.portal")
 
 
 # ---------------------------------------------------------------------------
-# Selectors. Keep them grouped here so they're easy to update.
-# Multiple fallbacks per element so a small portal change doesn't break us.
+# Selectors. Multiple fallbacks per element so a small portal change doesn't
+# break us. Order matters: most specific first.
 # ---------------------------------------------------------------------------
 
-SEL_USERNAME = ["#username", "input[name='username']"]
-SEL_PASSWORD = ["#user_pass", "input[name='user_pass']"]
-SEL_CAPTCHA_IMAGE = ["#imgCaptcha", "img.captcha-image", "img[alt*='captcha' i]"]
-SEL_CAPTCHA_INPUT = ["#captcha", "input[name='captcha']"]
+SEL_USERNAME = [
+    "#username",
+    "input[name='username']",
+    "input[placeholder*='Username' i]",
+]
+SEL_PASSWORD = [
+    "#user_pass",
+    "input[name='user_pass']",
+    "input[type='password']",
+]
+SEL_CAPTCHA_IMAGE = [
+    "#imgCaptcha",
+    "img[src*='captcha' i]",
+    "img.captcha-image",
+    "img[alt*='captcha' i]",
+    "img[ng-src*='captcha' i]",
+]
+SEL_CAPTCHA_INPUT = [
+    "#captcha",
+    "input[name='captcha']",
+    "input[placeholder*='captcha' i]",
+]
 SEL_LOGIN_BUTTON = [
+    "button.btn-primary:has-text('LOGIN')",
     "button[type='submit']:has-text('LOGIN')",
     "button:has-text('LOGIN')",
     "input[type='submit'][value='LOGIN' i]",
@@ -54,42 +78,88 @@ SEL_LOGIN_ERROR = [
     ".alert-danger",
     ".error-msg",
     "#errorMsg",
-    "div:has-text('Invalid Username or Password')",
+    "span.err",
+    "div[role='alert']",
 ]
-SEL_DASHBOARD_MARKER = [
-    "a:has-text('Return Dashboard')",
-    "a:has-text('Returns Dashboard')",
-    "text=Welcome",
+SEL_LOGGED_IN_MARKER = [
+    "a:has-text('Logout')",
+    "a:has-text('Sign Out')",
+    ":text('Welcome')",
+    ":text-matches('Last logged in on', 'i')",
 ]
 
-# Returns dashboard
-SEL_RETURNS_DASHBOARD_LINK = [
-    "a:has-text('Return Dashboard')",
-    "a:has-text('Returns Dashboard')",
+# Welcome page (services.gst.gov.in/services/auth/fowelcome)
+SEL_CONTINUE_TO_DASHBOARD = [
+    "button:has-text('CONTINUE TO DASHBOARD')",
+    "a:has-text('CONTINUE TO DASHBOARD')",
+    "button:has-text('RETURN DASHBOARD')",
+    "a:has-text('RETURN DASHBOARD')",
 ]
-SEL_FY_DROPDOWN = ["#fin", "select[name='fin']"]
-SEL_QUARTER_DROPDOWN = ["#quarter", "select[name='quarter']"]
-SEL_MONTH_DROPDOWN = ["#mon", "select[name='mon']"]
+
+# Returns dashboard (return.gst.gov.in/returns/auth/dashboard)
+SEL_FY_DROPDOWN = [
+    "select#fin",
+    "select[name='fin']",
+]
+SEL_QUARTER_DROPDOWN = [
+    "select#quarter",
+    "select[name='quarter']",
+]
+SEL_PERIOD_DROPDOWN = [
+    "select#mon",
+    "select[name='mon']",
+]
 SEL_SEARCH_BUTTON = [
+    "button.btn-primary:has-text('SEARCH')",
     "button:has-text('SEARCH')",
     "input[type='submit'][value='SEARCH' i]",
 ]
 
-# GSTR-2B tile + download
-SEL_GSTR2B_DOWNLOAD = [
-    "button:has-text('DOWNLOAD'):below(:text('GSTR-2B'))",
-    "a:has-text('DOWNLOAD'):below(:text('GSTR-2B'))",
-    "div:has-text('GSTR-2B') >> button:has-text('DOWNLOAD')",
+# GSTR-2B tile and its VIEW button.  The portal renders each return form as
+# a card with the form name (e.g. "GSTR2B") inside.  We want the VIEW button
+# inside that specific card.
+SEL_GSTR2B_TILE = [
+    "div.panel:has-text('GSTR2B')",
+    "div.panel:has-text('Auto - drafted ITC Statement')",
+    "div:has(> :text-matches('^GSTR.?2B$', 'i'))",
 ]
+SEL_GSTR2B_VIEW_BUTTON = [
+    "button:has-text('VIEW')",
+    "a:has-text('VIEW')",
+    "input[type='button'][value='VIEW' i]",
+]
+
+# GSTR-2B summary page (gstr2b.gst.gov.in/gstr2b/auth/...)
+SEL_NO_DATA_MARKERS = [
+    "text=/could not be generated/i",
+    "text=/no records to generate/i",
+    "text=/GSTR-?2B has not been generated/i",
+    "text=/data is not available/i",
+]
+SEL_DOWNLOAD_GSTR2B_EXCEL = [
+    "button:has-text('Download GSTR-2B details Excel')",
+    "a:has-text('Download GSTR-2B details Excel')",
+    "button:has-text('Download GSTR2B details Excel')",
+    "a:has-text('Download GSTR2B details Excel')",
+    "button:has-text('DOWNLOAD GSTR-2B DETAILS')",
+    "button:has-text('Download Excel')",
+    "a:has-text('Download Excel')",
+    # generic fallback: any button containing both Download and Excel
+    "button:text-matches('download.*excel', 'i')",
+    "a:text-matches('download.*excel', 'i')",
+]
+
+# A second-stage popup that some portal versions use:
+#   click "Download Excel" -> popup with "Generate Excel file" -> wait ->
+#   "Download Excel File" becomes enabled.
 SEL_GENERATE_EXCEL = [
     "button:has-text('GENERATE EXCEL FILE TO DOWNLOAD')",
-    "button:has-text('GENERATE EXCEL')",
-    "a:has-text('GENERATE EXCEL FILE TO DOWNLOAD')",
+    "button:has-text('Generate Excel')",
 ]
 SEL_DOWNLOAD_EXCEL_READY = [
     "button:has-text('DOWNLOAD EXCEL FILE')",
     "a:has-text('DOWNLOAD EXCEL FILE')",
-    "button:has-text('DOWNLOAD')",
+    "button:has-text('Click here to download')",
 ]
 
 
@@ -122,8 +192,12 @@ class DownloadError(PortalError):
     pass
 
 
+class NoDataAvailableError(PortalError):
+    """GSTR-2B not generated for the period (no purchases, or before 14th)."""
+
+
 # ---------------------------------------------------------------------------
-# Session
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -145,7 +219,7 @@ def _first_visible(page: Page, selectors: list[str], timeout_ms: int) -> _Select
         for sel in selectors:
             try:
                 loc = page.locator(sel).first
-                if loc.is_visible(timeout=500):
+                if loc.is_visible(timeout=400):
                     return _SelectorHit(selector=sel, locator=loc)
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
@@ -153,6 +227,38 @@ def _first_visible(page: Page, selectors: list[str], timeout_ms: int) -> _Select
     raise PWTimeout(
         f"None of the selectors became visible: {selectors}. Last error: {last_error}"
     )
+
+
+def _any_visible(page: Page, selectors: list[str], timeout_ms: int = 1500) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        for sel in selectors:
+            try:
+                if page.locator(sel).first.is_visible(timeout=300):
+                    return True
+            except Exception:
+                pass
+        time.sleep(0.2)
+    return False
+
+
+def _select_option_robust(locator, label_candidates: list[str]) -> str:
+    """Try each candidate label until one of them works. Returns chosen label."""
+    last_err: Exception | None = None
+    for label in label_candidates:
+        try:
+            locator.select_option(label=label)
+            return label
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+    raise PortalError(
+        f"None of the dropdown options matched: {label_candidates}. Last err: {last_err}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Session
+# ---------------------------------------------------------------------------
 
 
 class GstSession:
@@ -163,10 +269,14 @@ class GstSession:
         playwright: Playwright,
         download_dir: Path,
         headless: bool = True,
+        screenshot_dir: Optional[Path] = None,
+        client_name: str = "client",
     ) -> None:
         self._pw = playwright
         self._download_dir = download_dir
         self._headless = headless
+        self._screenshot_dir = screenshot_dir
+        self._client_name = client_name
         self._browser = None
         self._context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
@@ -200,51 +310,81 @@ class GstSession:
         assert self.page is not None
         log.info("Opening GST login page...")
         self.page.goto(config.GST_LOGIN_URL, timeout=config.PAGE_LOAD_TIMEOUT_MS)
-        # Wait for the login form
         _first_visible(self.page, SEL_USERNAME, config.ELEMENT_TIMEOUT_MS)
+
+    def enter_username(self, user_id: str) -> None:
+        """Click username field, type the username, wait for CAPTCHA to render.
+
+        On the GST portal the CAPTCHA image is lazily rendered after the
+        username field is focused and filled.  Do this BEFORE trying to
+        fetch the CAPTCHA image.
+        """
+        assert self.page is not None
+        u_hit = _first_visible(self.page, SEL_USERNAME, config.ELEMENT_TIMEOUT_MS)
+        u_hit.locator.click()
+        u_hit.locator.fill("")  # clear in case of pre-fill
+        u_hit.locator.type(user_id, delay=40)
+        # Push focus away so portal triggers CAPTCHA load
+        try:
+            self.page.keyboard.press("Tab")
+        except Exception:
+            pass
+        # Wait for CAPTCHA image to actually appear
+        try:
+            _first_visible(self.page, SEL_CAPTCHA_IMAGE, 12_000)
+        except PWTimeout as exc:
+            raise PortalError(
+                "CAPTCHA image did not appear after username entry."
+            ) from exc
 
     def fetch_captcha_image(self) -> bytes:
         """Return the current CAPTCHA image bytes (PNG)."""
         assert self.page is not None
         hit = _first_visible(self.page, SEL_CAPTCHA_IMAGE, config.ELEMENT_TIMEOUT_MS)
-        # screenshot of the element gives us the rendered pixels
         return hit.locator.screenshot()
 
     def refresh_captcha(self) -> None:
-        """Click the CAPTCHA image to refresh it (GST portal supports this)."""
+        """Click the CAPTCHA image to refresh it."""
         assert self.page is not None
         try:
             hit = _first_visible(self.page, SEL_CAPTCHA_IMAGE, 5000)
             hit.locator.click()
-            time.sleep(1)
+            time.sleep(1.2)
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not refresh CAPTCHA: %s", exc)
 
-    def submit_credentials(self, user_id: str, password: str, captcha_text: str) -> None:
-        """Fill the form and click LOGIN. Raises on known failures."""
+    def submit_login(self, password: str, captcha_text: str) -> None:
+        """Fill password + CAPTCHA and click LOGIN.
+
+        Username must already have been entered via enter_username().
+        """
         assert self.page is not None
         page = self.page
 
-        u_hit = _first_visible(page, SEL_USERNAME, config.ELEMENT_TIMEOUT_MS)
-        u_hit.locator.fill(user_id)
-        _human_pause()
-
         p_hit = _first_visible(page, SEL_PASSWORD, config.ELEMENT_TIMEOUT_MS)
-        p_hit.locator.fill(password)
+        # Clear the password field first (in case of retry)
+        p_hit.locator.fill("")
+        p_hit.locator.type(password, delay=30)
         _human_pause()
 
         c_hit = _first_visible(page, SEL_CAPTCHA_INPUT, config.ELEMENT_TIMEOUT_MS)
-        c_hit.locator.fill(captcha_text)
+        c_hit.locator.fill("")
+        c_hit.locator.type(captcha_text, delay=30)
         _human_pause()
 
         btn = _first_visible(page, SEL_LOGIN_BUTTON, config.ELEMENT_TIMEOUT_MS)
         btn.locator.click()
 
-        # Wait for either dashboard OR a known error
-        deadline = time.monotonic() + 25
+        # Wait for either logged-in marker OR a known error
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            if any(self._is_visible(sel) for sel in SEL_DASHBOARD_MARKER):
-                log.info("Login successful.")
+            # Success: URL moved to authenticated area
+            cur_url = page.url or ""
+            if "/auth/" in cur_url or "/services/auth/" in cur_url:
+                log.info("Login successful (URL=%s).", cur_url)
+                return
+            if _any_visible(page, SEL_LOGGED_IN_MARKER, timeout_ms=400):
+                log.info("Login successful (marker visible).")
                 return
             err_text = self._read_first_visible_text(SEL_LOGIN_ERROR)
             if err_text:
@@ -252,134 +392,284 @@ class GstSession:
                 log.warning("Login error message: %s", err_text)
                 if "captcha" in err_lc:
                     raise CaptchaFailedError(err_text)
-                if "username" in err_lc and "password" in err_lc:
+                if ("invalid" in err_lc and ("user" in err_lc or "password" in err_lc)) \
+                        or "incorrect" in err_lc:
                     raise WrongPasswordError(err_text)
-                if "invalid" in err_lc or "incorrect" in err_lc:
-                    raise WrongPasswordError(err_text)
+                if "locked" in err_lc or "blocked" in err_lc:
+                    raise LoginFailedError(err_text)
+                # Unknown error -> treat as login failed
                 raise LoginFailedError(err_text)
             time.sleep(0.5)
 
         raise LoginFailedError(
-            "Login did not complete in time (no dashboard, no error message)."
+            "Login did not complete in time (no auth URL, no error message)."
         )
 
-    # ------------------ navigate to GSTR-2B ------------------
+    # ------------------ post-login navigation ------------------
+
+    def handle_post_login(self) -> None:
+        """If the welcome page appears, click 'Continue to Dashboard'.
+
+        Best-effort -- if the page goes straight to dashboard, no-op.
+        """
+        assert self.page is not None
+        try:
+            hit = _first_visible(self.page, SEL_CONTINUE_TO_DASHBOARD, 5000)
+            log.info("Welcome page detected, clicking '%s' to proceed.",
+                     hit.selector)
+            hit.locator.click()
+            _human_pause()
+        except PWTimeout:
+            log.debug("No welcome page interstitial -- continuing.")
 
     def navigate_to_returns_dashboard(self) -> None:
+        """Go directly to the File Returns page on return.gst.gov.in."""
         assert self.page is not None
-        log.info("Navigating to Returns Dashboard...")
+        log.info("Navigating to Returns Dashboard (%s)...",
+                 config.GST_RETURNS_DASHBOARD_URL)
+        self.page.goto(config.GST_RETURNS_DASHBOARD_URL,
+                       timeout=config.PAGE_LOAD_TIMEOUT_MS)
         try:
-            hit = _first_visible(self.page, SEL_RETURNS_DASHBOARD_LINK, 8000)
-            hit.locator.click()
-        except PWTimeout:
-            # Fallback: direct URL
-            self.page.goto(config.GST_RETURNS_DASHBOARD_URL,
-                           timeout=config.PAGE_LOAD_TIMEOUT_MS)
-        _first_visible(self.page, SEL_FY_DROPDOWN, config.ELEMENT_TIMEOUT_MS)
+            _first_visible(self.page, SEL_FY_DROPDOWN, config.ELEMENT_TIMEOUT_MS)
+        except PWTimeout as exc:
+            raise NavigationError(
+                "Returns Dashboard FY dropdown did not appear."
+            ) from exc
 
     def select_period(self, year: int, month: int) -> None:
-        """Select FY + month, then click SEARCH."""
+        """Select Financial Year, Quarter, Period (month), then click SEARCH."""
         assert self.page is not None
         page = self.page
 
         fy = config.fy_string_for(year, month)
         log.info("Selecting period FY=%s month=%d/%d", fy, month, year)
 
+        # Financial Year - try multiple label variants
         fy_hit = _first_visible(page, SEL_FY_DROPDOWN, config.ELEMENT_TIMEOUT_MS)
-        fy_hit.locator.select_option(label=fy)
+        _select_option_robust(fy_hit.locator, [fy, fy.replace("-", "-")])
         _human_pause()
 
-        # Some pages have Quarter dropdown — pick the quarter that contains month.
+        # Quarter (mandatory on current portal)
         try:
-            q_hit = _first_visible(page, SEL_QUARTER_DROPDOWN, 3000)
-            quarter_label = _quarter_label(month)
-            q_hit.locator.select_option(label=quarter_label)
+            q_hit = _first_visible(page, SEL_QUARTER_DROPDOWN, 4000)
+            quarter_labels = _quarter_label_candidates(month)
+            chosen = _select_option_robust(q_hit.locator, quarter_labels)
+            log.info("Quarter selected: %s", chosen)
             _human_pause()
         except PWTimeout:
-            pass  # no quarter dropdown on this layout
+            log.info("No Quarter dropdown on this layout (skipping).")
 
-        m_hit = _first_visible(page, SEL_MONTH_DROPDOWN, config.ELEMENT_TIMEOUT_MS)
-        month_label = _full_month_label(month)
-        m_hit.locator.select_option(label=month_label)
+        # Period (month)
+        m_hit = _first_visible(page, SEL_PERIOD_DROPDOWN, config.ELEMENT_TIMEOUT_MS)
+        month_labels = _month_label_candidates(month)
+        chosen = _select_option_robust(m_hit.locator, month_labels)
+        log.info("Period selected: %s", chosen)
         _human_pause()
 
         search = _first_visible(page, SEL_SEARCH_BUTTON, config.ELEMENT_TIMEOUT_MS)
         search.locator.click()
+
+        # Wait for tiles to render. We assume the GSTR2B tile will appear.
         time.sleep(2)
+        try:
+            _first_visible(page, SEL_GSTR2B_TILE + ["text=/GSTR.?2B/i"],
+                           config.ELEMENT_TIMEOUT_MS)
+        except PWTimeout as exc:
+            raise NavigationError(
+                "Tiles (including GSTR-2B) did not appear after SEARCH."
+            ) from exc
 
-    def download_gstr2b(self, save_path: Path) -> Path:
-        """Click DOWNLOAD on the GSTR-2B tile, then DOWNLOAD EXCEL.
+    def open_gstr2b_view(self) -> None:
+        """Click the VIEW button inside the GSTR-2B tile."""
+        assert self.page is not None
+        page = self.page
+        log.info("Clicking VIEW under GSTR-2B tile...")
 
-        Saves the file to `save_path` (parent dirs must exist).
-        Returns the final path.
+        last_err: Exception | None = None
+        # Strategy 1: tile-scoped lookup
+        for tile_sel in SEL_GSTR2B_TILE:
+            try:
+                tile = page.locator(tile_sel).first
+                if not tile.is_visible(timeout=1000):
+                    continue
+                for view_sel in SEL_GSTR2B_VIEW_BUTTON:
+                    btn = tile.locator(view_sel).first
+                    try:
+                        if btn.is_visible(timeout=1000):
+                            btn.click()
+                            log.info("VIEW clicked via tile=%r view=%r",
+                                     tile_sel, view_sel)
+                            self._wait_for_gstr2b_summary()
+                            return
+                    except Exception as exc:  # noqa: BLE001
+                        last_err = exc
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+
+        # Strategy 2: positional fallback (VIEW button right of GSTR-2B text)
+        try:
+            btn = page.locator(
+                "button:has-text('VIEW')"
+            ).filter(has=page.locator(":scope")).first
+            # Use Playwright "near" semantics
+            btn = page.get_by_role("button", name=re.compile("^VIEW$", re.I)).filter(
+                has_not_text="GSTR3B"
+            ).first
+            btn.click(timeout=5000)
+            log.info("VIEW clicked via role+name fallback")
+            self._wait_for_gstr2b_summary()
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+
+        raise NavigationError(
+            f"Could not click VIEW under GSTR-2B tile. Last error: {last_err}"
+        )
+
+    def _wait_for_gstr2b_summary(self) -> None:
+        """Wait for either the GSTR-2B summary header or a 'no data' message."""
+        assert self.page is not None
+        page = self.page
+        # The summary page may open as a new tab in some portal versions.
+        # Switch to the latest tab if so.
+        try:
+            ctx = page.context
+            if len(ctx.pages) > 1:
+                self.page = ctx.pages[-1]
+                page = self.page
+                log.info("Switched to new tab for GSTR-2B summary.")
+        except Exception:
+            pass
+
+        # Wait for any of: summary header, no-data message, download button
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if _any_visible(page,
+                            SEL_NO_DATA_MARKERS
+                            + SEL_DOWNLOAD_GSTR2B_EXCEL
+                            + ["text=/AUTO.?DRAFTED ITC STATEMENT/i",
+                               "text=/GSTR.?2B/i"],
+                            timeout_ms=600):
+                return
+            time.sleep(0.4)
+        raise NavigationError(
+            "GSTR-2B summary page did not load (no header, no download, no error)."
+        )
+
+    # ------------------ download ------------------
+
+    def download_gstr2b_excel(self, save_path: Path) -> Path:
+        """Click 'Download GSTR-2B details Excel' on the summary page.
+
+        Raises NoDataAvailableError if the portal shows the
+        'GSTR-2B could not be generated' message.
         """
         assert self.page is not None
         page = self.page
-        log.info("Initiating GSTR-2B download...")
 
-        # Step 1: GSTR-2B tile DOWNLOAD button
+        # First check for "no data" — this is a normal/expected case for
+        # current month before 14th, or clients with no purchases.
+        if _any_visible(page, SEL_NO_DATA_MARKERS, timeout_ms=2000):
+            err_text = self._read_first_visible_text(SEL_NO_DATA_MARKERS)
+            log.info("No GSTR-2B data for this period: %s", err_text)
+            raise NoDataAvailableError(
+                err_text or "GSTR-2B not generated for this period."
+            )
+
+        # Click the Download button
         try:
-            tile = _first_visible(page, SEL_GSTR2B_DOWNLOAD,
-                                  config.ELEMENT_TIMEOUT_MS)
-            tile.locator.click()
+            btn_hit = _first_visible(page, SEL_DOWNLOAD_GSTR2B_EXCEL,
+                                     config.ELEMENT_TIMEOUT_MS)
         except PWTimeout as exc:
-            raise NavigationError(
-                "GSTR-2B DOWNLOAD button not found on returns dashboard."
+            # Re-check no-data with a longer timeout in case it appeared late
+            if _any_visible(page, SEL_NO_DATA_MARKERS, timeout_ms=3000):
+                err_text = self._read_first_visible_text(SEL_NO_DATA_MARKERS)
+                raise NoDataAvailableError(
+                    err_text or "GSTR-2B not generated for this period."
+                ) from exc
+            raise DownloadError(
+                "'Download GSTR-2B details Excel' button not found on summary page."
             ) from exc
 
-        # Step 2: GENERATE EXCEL FILE TO DOWNLOAD
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Some portal versions stream the file straight to a download.
+        # Others first show a popup with "Generate Excel" then "Download".
+        # Try the streaming path first, then fall back to two-step popup.
         try:
-            gen = _first_visible(page, SEL_GENERATE_EXCEL,
-                                 config.ELEMENT_TIMEOUT_MS)
+            with page.expect_download(timeout=15_000) as dl_info:
+                btn_hit.locator.click()
+            download = dl_info.value
+            download.save_as(str(save_path))
+            log.info("Saved (direct): %s", save_path)
+            return save_path
+        except PWTimeout:
+            log.info("Direct download did not start; trying generate-then-download flow.")
+
+        # Two-step popup: GENERATE then DOWNLOAD
+        try:
+            gen = _first_visible(page, SEL_GENERATE_EXCEL, 8000)
             gen.locator.click()
-        except PWTimeout as exc:
-            raise NavigationError(
-                "'Generate Excel' button not found on GSTR-2B page."
-            ) from exc
+            log.info("Clicked GENERATE EXCEL; waiting for portal to prepare file...")
+        except PWTimeout:
+            log.info("No GENERATE button visible; will wait for ready button.")
 
-        # The portal shows a "request being processed" message and after a
-        # few seconds the actual download button becomes enabled.
-        log.info("Waiting for portal to prepare the file (up to 90s)...")
-        deadline = time.monotonic() + 90
-        download_btn = None
+        deadline = time.monotonic() + 120
+        ready_btn = None
         while time.monotonic() < deadline:
             try:
-                download_btn = _first_visible(page, SEL_DOWNLOAD_EXCEL_READY, 2000)
+                ready_btn = _first_visible(page, SEL_DOWNLOAD_EXCEL_READY, 2000)
                 break
             except PWTimeout:
-                pass
-        if download_btn is None:
+                if _any_visible(page, SEL_NO_DATA_MARKERS, timeout_ms=500):
+                    err_text = self._read_first_visible_text(SEL_NO_DATA_MARKERS)
+                    raise NoDataAvailableError(
+                        err_text or "GSTR-2B not generated."
+                    )
+        if ready_btn is None:
             raise DownloadError(
                 "Portal did not produce a downloadable file in time."
             )
 
-        # Step 3: click and capture the download
-        save_path.parent.mkdir(parents=True, exist_ok=True)
         with page.expect_download(timeout=120_000) as dl_info:
-            download_btn.locator.click()
+            ready_btn.locator.click()
         download = dl_info.value
         download.save_as(str(save_path))
-        log.info("Saved: %s", save_path)
+        log.info("Saved (two-step): %s", save_path)
         return save_path
 
     def logout(self) -> None:
         """Best-effort logout to release the GST session quickly."""
         assert self.page is not None
         try:
-            self.page.locator("a:has-text('Logout'), a:has-text('Sign Out')").first.click(
-                timeout=3000
-            )
-        except Exception:  # noqa: BLE001
+            self.page.locator(
+                "a:has-text('Logout'), a:has-text('Sign Out')"
+            ).first.click(timeout=3000)
+        except Exception:
             pass
 
-    # ------------------ small helpers ------------------
+    # ------------------ debug helpers ------------------
 
-    def _is_visible(self, selector: str) -> bool:
-        assert self.page is not None
+    def take_screenshot(self, label: str) -> Optional[Path]:
+        """Save a screenshot of the current page for debugging.
+
+        Returns the path or None if screenshot dir not configured.
+        """
+        if not self._screenshot_dir or self.page is None:
+            return None
         try:
-            return self.page.locator(selector).first.is_visible(timeout=300)
-        except Exception:
-            return False
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe = re.sub(r"[^A-Za-z0-9_-]", "_", self._client_name)[:40]
+            self._screenshot_dir.mkdir(parents=True, exist_ok=True)
+            p = self._screenshot_dir / f"{safe}_{label}_{ts}.png"
+            self.page.screenshot(path=str(p), full_page=True)
+            log.info("Screenshot saved: %s", p)
+            return p
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not save screenshot: %s", exc)
+            return None
+
+    # ------------------ small helpers ------------------
 
     def _read_first_visible_text(self, selectors: list[str]) -> str:
         assert self.page is not None
@@ -412,18 +702,37 @@ def playwright_session() -> Iterator[Playwright]:
 # ---------------------------------------------------------------------------
 
 
-def _full_month_label(month: int) -> str:
-    return [
+def _month_label_candidates(month: int) -> list[str]:
+    full = [
         "January", "February", "March", "April", "May", "June",
         "July", "August", "September", "October", "November", "December",
     ][month - 1]
+    short = full[:3]
+    return [full, short, full.upper(), short.upper()]
 
 
-def _quarter_label(month: int) -> str:
+def _quarter_label_candidates(month: int) -> list[str]:
+    """Return all label variants the portal might use for a given quarter.
+
+    GSTN's wording has historically varied across:
+        'Quarter 1 (Apr - Jun)' / 'Apr-Jun' / 'Q1 (Apr-Jun)' etc.
+    """
     if month in (4, 5, 6):
-        return "Apr - Jun"
+        return [
+            "Quarter 1 (Apr - Jun)", "Quarter 1 (Apr-Jun)",
+            "Q1 (Apr - Jun)", "Q1 (Apr-Jun)", "Apr - Jun", "Apr-Jun",
+        ]
     if month in (7, 8, 9):
-        return "Jul - Sep"
+        return [
+            "Quarter 2 (Jul - Sep)", "Quarter 2 (Jul-Sep)",
+            "Q2 (Jul - Sep)", "Q2 (Jul-Sep)", "Jul - Sep", "Jul-Sep",
+        ]
     if month in (10, 11, 12):
-        return "Oct - Dec"
-    return "Jan - Mar"
+        return [
+            "Quarter 3 (Oct - Dec)", "Quarter 3 (Oct-Dec)",
+            "Q3 (Oct - Dec)", "Q3 (Oct-Dec)", "Oct - Dec", "Oct-Dec",
+        ]
+    return [
+        "Quarter 4 (Jan - Mar)", "Quarter 4 (Jan-Mar)",
+        "Q4 (Jan - Mar)", "Q4 (Jan-Mar)", "Jan - Mar", "Jan-Mar",
+    ]

@@ -22,6 +22,7 @@ from .gst_portal import (
     GstSession,
     LoginFailedError,
     NavigationError,
+    NoDataAvailableError,
     PortalError,
     WrongPasswordError,
     playwright_session,
@@ -82,9 +83,20 @@ def _process_one(
 
     log.info("[%s] starting", client.name)
 
+    sess: Optional[GstSession] = None
     try:
-        with GstSession(pw, target_file.parent, headless=opts.headless) as sess:
+        sess_cm = GstSession(
+            pw,
+            target_file.parent,
+            headless=opts.headless,
+            screenshot_dir=config.SCREENSHOTS_DIR,
+            client_name=client.name,
+        )
+        with sess_cm as sess:
             sess.open_login_page()
+
+            # NEW LOGIN FLOW: username must be entered BEFORE CAPTCHA loads
+            sess.enter_username(client.user_id)
 
             # CAPTCHA + login with retries
             login_done = False
@@ -112,9 +124,7 @@ def _process_one(
                     continue
 
                 try:
-                    sess.submit_credentials(
-                        client.user_id, client.password, captcha_text
-                    )
+                    sess.submit_login(client.password, captcha_text)
                     login_done = True
                     break
                 except CaptchaFailedError as exc:
@@ -133,9 +143,11 @@ def _process_one(
                     + (f" ({last_error})" if last_error else "")
                 )
 
+            sess.handle_post_login()
             sess.navigate_to_returns_dashboard()
             sess.select_period(opts.year, opts.month)
-            saved = sess.download_gstr2b(target_file)
+            sess.open_gstr2b_view()
+            saved = sess.download_gstr2b_excel(target_file)
 
             sess.logout()
             result.status = "Success"
@@ -145,33 +157,54 @@ def _process_one(
         result.status = "Wrong Password"
         result.error_reason = str(exc)
         log.error("[%s] WRONG PASSWORD: %s", client.name, exc)
+        _safe_screenshot(sess, "wrong_password")
     except CaptchaFailedError as exc:
         result.status = "CAPTCHA Failed"
         result.error_reason = str(exc)
         log.error("[%s] CAPTCHA FAILED: %s", client.name, exc)
+        _safe_screenshot(sess, "captcha_failed")
     except LoginFailedError as exc:
         result.status = "Failed Login"
         result.error_reason = str(exc)
         log.error("[%s] LOGIN FAILED: %s", client.name, exc)
+        _safe_screenshot(sess, "login_failed")
+    except NoDataAvailableError as exc:
+        result.status = "No Data Available"
+        result.error_reason = str(exc)
+        log.info("[%s] NO DATA: %s", client.name, exc)
     except NavigationError as exc:
         result.status = "Portal Error"
         result.error_reason = f"Navigation: {exc}"
         log.error("[%s] NAV ERROR: %s", client.name, exc)
+        _safe_screenshot(sess, "nav_error")
     except DownloadError as exc:
         result.status = "Portal Error"
         result.error_reason = f"Download: {exc}"
         log.error("[%s] DOWNLOAD ERROR: %s", client.name, exc)
+        _safe_screenshot(sess, "download_error")
     except PortalError as exc:
         result.status = "Portal Error"
         result.error_reason = str(exc)
         log.error("[%s] PORTAL ERROR: %s", client.name, exc)
+        _safe_screenshot(sess, "portal_error")
     except Exception as exc:  # noqa: BLE001
         result.status = "Portal Error"
         result.error_reason = f"Unexpected: {exc}"
         log.exception("[%s] UNEXPECTED", client.name)
+        _safe_screenshot(sess, "unexpected")
 
     result.finished_at = datetime.now().strftime("%H:%M:%S")
     return result
+
+
+def _safe_screenshot(sess: Optional[GstSession], label: str) -> None:
+    """Save a debug screenshot if we still have an open session."""
+    if sess is None:
+        return
+    try:
+        sess.take_screenshot(label)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def run_batch(

@@ -25,6 +25,7 @@ DATA_DIR = ROOT_DIR / "data"
 DOWNLOADS_DIR = ROOT_DIR / "GSTR-2B"
 REPORTS_DIR = ROOT_DIR / "Reports"
 LOGS_DIR = ROOT_DIR / "logs"
+SCREENSHOTS_DIR = LOGS_DIR / "screenshots"
 SAMPLE_EXCEL = ROOT_DIR / "sample_clients.xlsx"
 VAULT_FILE = DATA_DIR / "vault.dat"
 
@@ -57,7 +58,7 @@ MONTH_NUMBER = {name: idx for idx, name in enumerate(
 
 def ensure_dirs() -> None:
     """Create all data folders if missing."""
-    for d in (DATA_DIR, DOWNLOADS_DIR, REPORTS_DIR, LOGS_DIR):
+    for d in (DATA_DIR, DOWNLOADS_DIR, REPORTS_DIR, LOGS_DIR, SCREENSHOTS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
