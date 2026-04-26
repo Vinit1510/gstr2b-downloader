@@ -12,7 +12,6 @@ class ManualCaptchaDialog(ctk.CTkToplevel):
     def __init__(self, parent, image_bytes: bytes, attempt: int, client_name: str) -> None:
         super().__init__(parent)
         self.title(f"CAPTCHA — {client_name}")
-        self.geometry("420x320")
         self.resizable(False, False)
         self.grab_set()
         self.transient(parent)
@@ -22,23 +21,42 @@ class ManualCaptchaDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             self,
             text=f"Auto-solve failed (attempt {attempt}). Please type the CAPTCHA below:",
-            wraplength=380,
-        ).pack(pady=(14, 6))
+            wraplength=520,
+        ).pack(pady=(14, 6), padx=20)
 
-        # Show the captcha image (scaled up 3x for readability)
+        # Show the captcha image. The portal CAPTCHA is small (~200x60),
+        # so we upscale it for readability -- but using PIL's LANCZOS
+        # resampling so the image stays SHARP and is NOT stretched/blurred
+        # the way CTkImage's default nearest-neighbour upscale does.
+        img_w_display = 360  # final on-screen width
+        img_h_display = 120  # final on-screen height
         try:
             pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            w, h = pil_img.size
-            scale = 3
+            orig_w, orig_h = pil_img.size
+
+            # Preserve aspect ratio: fit inside (img_w_display, img_h_display).
+            ratio = min(img_w_display / orig_w, img_h_display / orig_h)
+            target_w = max(1, int(orig_w * ratio))
+            target_h = max(1, int(orig_h * ratio))
+
+            # High-quality resize with LANCZOS so the image looks crisp
+            # rather than stretched / pixelated.
+            pil_resized = pil_img.resize((target_w, target_h), Image.LANCZOS)
+
             ctk_img = ctk.CTkImage(
-                light_image=pil_img,
-                dark_image=pil_img,
-                size=(w * scale, h * scale),
+                light_image=pil_resized,
+                dark_image=pil_resized,
+                size=(target_w, target_h),
             )
             ctk.CTkLabel(self, text="", image=ctk_img).pack(pady=8)
             self._img_ref = ctk_img
+            dialog_w = max(420, target_w + 80)
+            dialog_h = 260 + target_h
         except Exception:  # noqa: BLE001
             ctk.CTkLabel(self, text="(could not display CAPTCHA image)").pack(pady=8)
+            dialog_w, dialog_h = 420, 320
+
+        self.geometry(f"{dialog_w}x{dialog_h}")
 
         self._entry = ctk.CTkEntry(self, placeholder_text="6-character CAPTCHA", height=36, width=240)
         self._entry.pack(pady=8)
