@@ -112,7 +112,6 @@ a = Analysis(
         # EasyOCR imports torch.testing during initialisation; excluding it
         # breaks CAPTCHA auto-solve at runtime ("No module named 'torch.testing'").
         "matplotlib",
-        "scipy",
         "tkinter.test",
     ],
     win_no_prefer_redirects=False,
