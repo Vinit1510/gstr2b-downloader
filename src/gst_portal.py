@@ -8,11 +8,14 @@ Real-world flow (verified from live portal April 2026):
     2. enter_username(user_id)            -> typing username triggers CAPTCHA load
     3. fetch_captcha_image() -> bytes
     4. submit_login(password, captcha_text)
-    5. (auto) handle_post_login()         -> dismisses welcome page if present
-    6. navigate_to_returns_dashboard()    -> goes to return.gst.gov.in
-    7. select_period(year, month)         -> FY + Quarter + Period
-    8. open_gstr2b_view()                 -> click VIEW on GSTR-2B tile
-    9. download_gstr2b_excel(save_path)   -> on summary page click "Download
+    5. navigate_to_returns_dashboard()    -> CLICK-based: either welcome-page
+                                             "RETURN DASHBOARD" button or
+                                             top-nav Services > Returns Dashboard.
+                                             Direct URL jumps break the GST
+                                             portal session, so we always click.
+    6. select_period(year, month)         -> FY + Quarter + Period
+    7. open_gstr2b_view()                 -> click VIEW on GSTR-2B tile
+    8. download_gstr2b_excel(save_path)   -> on summary page click "Download
                                              GSTR-2B details Excel"; if portal
                                              says "no data" raise NoDataAvailableError
 """
@@ -89,11 +92,24 @@ SEL_LOGGED_IN_MARKER = [
 ]
 
 # Welcome page (services.gst.gov.in/services/auth/fowelcome)
-SEL_CONTINUE_TO_DASHBOARD = [
-    "button:has-text('CONTINUE TO DASHBOARD')",
-    "a:has-text('CONTINUE TO DASHBOARD')",
+# This is the BIG button on the welcome page that takes us straight to the
+# Returns Dashboard. We prefer it because it's a single direct click.
+SEL_WELCOME_RETURN_DASHBOARD_BTN = [
     "button:has-text('RETURN DASHBOARD')",
     "a:has-text('RETURN DASHBOARD')",
+    "button:has-text('Return Dashboard')",
+    "a:has-text('Return Dashboard')",
+]
+
+# Top-nav menu fallback: Services dropdown -> Returns Dashboard link
+SEL_TOPNAV_SERVICES = [
+    "a.dropdown-toggle:has-text('Services')",
+    "li.dropdown:has-text('Services') > a",
+    "a:has-text('Services')",
+]
+SEL_TOPNAV_RETURNS_DASHBOARD = [
+    "a:has-text('Returns Dashboard')",
+    "a:has-text('Return Dashboard')",
 ]
 
 # Returns dashboard (return.gst.gov.in/returns/auth/dashboard)
@@ -407,33 +423,78 @@ class GstSession:
 
     # ------------------ post-login navigation ------------------
 
-    def handle_post_login(self) -> None:
-        """If the welcome page appears, click 'Continue to Dashboard'.
+    def navigate_to_returns_dashboard(self) -> None:
+        """Click our way to the File Returns page (NO direct URL jumps).
 
-        Best-effort -- if the page goes straight to dashboard, no-op.
+        The GST portal session is fragile across direct URL navigations to
+        a different sub-domain (return.gst.gov.in). It expects a real-user
+        navigation: either click the 'RETURN DASHBOARD' button on the
+        welcome page, or use the top-nav 'Services > Returns Dashboard'.
+        """
+        assert self.page is not None
+        page = self.page
+        log.info("Navigating to Returns Dashboard via clicks...")
+
+        # Strategy 1: welcome-page big button "RETURN DASHBOARD"
+        try:
+            hit = _first_visible(page, SEL_WELCOME_RETURN_DASHBOARD_BTN, 4000)
+            log.info("Clicking welcome-page button: %s", hit.selector)
+            hit.locator.click()
+            self._wait_for_returns_dashboard()
+            return
+        except PWTimeout:
+            log.info("Welcome-page 'RETURN DASHBOARD' not visible; "
+                     "falling back to top-nav menu.")
+
+        # Strategy 2: top-nav menu Services > Returns Dashboard
+        try:
+            services = _first_visible(page, SEL_TOPNAV_SERVICES,
+                                      config.ELEMENT_TIMEOUT_MS)
+            # Try hover first (dropdown may open on hover); if that doesn't
+            # reveal the link, click the menu to expand it.
+            try:
+                services.locator.hover()
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+            try:
+                rd = _first_visible(page, SEL_TOPNAV_RETURNS_DASHBOARD, 2000)
+            except PWTimeout:
+                # Hover didn't reveal link; click to expand
+                services.locator.click()
+                time.sleep(0.5)
+                rd = _first_visible(page, SEL_TOPNAV_RETURNS_DASHBOARD,
+                                    config.ELEMENT_TIMEOUT_MS)
+
+            log.info("Clicking menu link: %s", rd.selector)
+            rd.locator.click()
+            self._wait_for_returns_dashboard()
+            return
+        except PWTimeout as exc:
+            raise NavigationError(
+                "Could not navigate to Returns Dashboard via clicks "
+                "(welcome-page button missing AND Services menu unreachable)."
+            ) from exc
+
+    def _wait_for_returns_dashboard(self) -> None:
+        """Wait for the File Returns page (FY dropdown visible).
+
+        Some portal versions open the dashboard in a new tab — handle that.
         """
         assert self.page is not None
         try:
-            hit = _first_visible(self.page, SEL_CONTINUE_TO_DASHBOARD, 5000)
-            log.info("Welcome page detected, clicking '%s' to proceed.",
-                     hit.selector)
-            hit.locator.click()
-            _human_pause()
-        except PWTimeout:
-            log.debug("No welcome page interstitial -- continuing.")
-
-    def navigate_to_returns_dashboard(self) -> None:
-        """Go directly to the File Returns page on return.gst.gov.in."""
-        assert self.page is not None
-        log.info("Navigating to Returns Dashboard (%s)...",
-                 config.GST_RETURNS_DASHBOARD_URL)
-        self.page.goto(config.GST_RETURNS_DASHBOARD_URL,
-                       timeout=config.PAGE_LOAD_TIMEOUT_MS)
+            ctx = self.page.context
+            if len(ctx.pages) > 1:
+                self.page = ctx.pages[-1]
+                log.info("Switched to new tab for Returns Dashboard.")
+        except Exception:
+            pass
         try:
             _first_visible(self.page, SEL_FY_DROPDOWN, config.ELEMENT_TIMEOUT_MS)
         except PWTimeout as exc:
             raise NavigationError(
-                "Returns Dashboard FY dropdown did not appear."
+                "Returns Dashboard FY dropdown did not appear after click."
             ) from exc
 
     def select_period(self, year: int, month: int) -> None:

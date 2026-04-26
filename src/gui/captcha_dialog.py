@@ -42,7 +42,6 @@ class ManualCaptchaDialog(ctk.CTkToplevel):
 
         self._entry = ctk.CTkEntry(self, placeholder_text="6-character CAPTCHA", height=36, width=240)
         self._entry.pack(pady=8)
-        self._entry.focus_set()
         self._entry.bind("<Return>", lambda _e: self._submit())
 
         row = ctk.CTkFrame(self, fg_color="transparent")
@@ -53,6 +52,22 @@ class ManualCaptchaDialog(ctk.CTkToplevel):
                       command=self._submit).pack(side="left", padx=6)
 
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        # Force focus into the CAPTCHA input box once the window is fully
+        # rendered, so the user can start typing immediately. A plain
+        # focus_set() before the window is mapped is silently ignored on
+        # Windows, so we delay slightly and use focus_force().
+        self.after(120, self._focus_input)
+
+    def _focus_input(self) -> None:
+        try:
+            self.lift()
+            self.focus_force()
+            self._entry.focus_force()
+            # Place the text cursor at the end of the (empty) field
+            self._entry.icursor("end")
+        except Exception:
+            pass
 
     def _submit(self) -> None:
         v = (self._entry.get() or "").strip()

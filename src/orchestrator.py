@@ -93,81 +93,103 @@ def _process_one(
             client_name=client.name,
         )
         with sess_cm as sess:
-            sess.open_login_page()
+            try:
+                sess.open_login_page()
 
-            # NEW LOGIN FLOW: username must be entered BEFORE CAPTCHA loads
-            sess.enter_username(client.user_id)
+                # Username must be entered BEFORE CAPTCHA loads
+                sess.enter_username(client.user_id)
 
-            # CAPTCHA + login with retries
-            login_done = False
-            last_error: Exception | None = None
-            for attempt in range(1, opts.max_captcha_attempts + 1):
-                if opts.cancel_event and opts.cancel_event.is_set():
-                    raise RuntimeError("Cancelled by user.")
+                # CAPTCHA + login with retries
+                login_done = False
+                last_error: Exception | None = None
+                for attempt in range(1, opts.max_captcha_attempts + 1):
+                    if opts.cancel_event and opts.cancel_event.is_set():
+                        raise RuntimeError("Cancelled by user.")
 
-                img = sess.fetch_captcha_image()
-                solved = solve_captcha(img)
+                    img = sess.fetch_captcha_image()
+                    solved = solve_captcha(img)
 
-                captcha_text: Optional[str] = solved
-                if not captcha_text and manual_captcha_cb:
-                    log.info("[%s] OCR failed; asking user (attempt %d)",
-                             client.name, attempt)
-                    captcha_text = manual_captcha_cb(img, attempt)
-                    if not captcha_text:
-                        raise CaptchaFailedError(
-                            "User cancelled manual CAPTCHA entry."
-                        )
-                elif not captcha_text:
-                    log.warning("[%s] OCR failed and no manual fallback set",
-                                client.name)
-                    sess.refresh_captcha()
-                    continue
+                    captcha_text: Optional[str] = solved
+                    if not captcha_text and manual_captcha_cb:
+                        log.info("[%s] OCR failed; asking user (attempt %d)",
+                                 client.name, attempt)
+                        captcha_text = manual_captcha_cb(img, attempt)
+                        if not captcha_text:
+                            raise CaptchaFailedError(
+                                "User cancelled manual CAPTCHA entry."
+                            )
+                    elif not captcha_text:
+                        log.warning("[%s] OCR failed and no manual fallback set",
+                                    client.name)
+                        sess.refresh_captcha()
+                        continue
 
-                try:
-                    sess.submit_login(client.password, captcha_text)
-                    login_done = True
-                    break
-                except CaptchaFailedError as exc:
-                    last_error = exc
-                    log.warning("[%s] Wrong CAPTCHA (attempt %d/%d): %s",
-                                client.name, attempt,
-                                opts.max_captcha_attempts, exc)
-                    sess.refresh_captcha()
-                    continue
-                except WrongPasswordError as exc:
-                    raise exc
+                    try:
+                        sess.submit_login(client.password, captcha_text)
+                        login_done = True
+                        break
+                    except CaptchaFailedError as exc:
+                        last_error = exc
+                        log.warning("[%s] Wrong CAPTCHA (attempt %d/%d): %s",
+                                    client.name, attempt,
+                                    opts.max_captcha_attempts, exc)
+                        sess.refresh_captcha()
+                        continue
+                    except WrongPasswordError as exc:
+                        raise exc
 
-            if not login_done:
-                raise CaptchaFailedError(
-                    f"CAPTCHA failed after {opts.max_captcha_attempts} attempts"
-                    + (f" ({last_error})" if last_error else "")
-                )
+                if not login_done:
+                    raise CaptchaFailedError(
+                        f"CAPTCHA failed after {opts.max_captcha_attempts} attempts"
+                        + (f" ({last_error})" if last_error else "")
+                    )
 
-            sess.handle_post_login()
-            sess.navigate_to_returns_dashboard()
-            sess.select_period(opts.year, opts.month)
-            sess.open_gstr2b_view()
-            saved = sess.download_gstr2b_excel(target_file)
+                sess.navigate_to_returns_dashboard()
+                sess.select_period(opts.year, opts.month)
+                sess.open_gstr2b_view()
+                saved = sess.download_gstr2b_excel(target_file)
 
-            sess.logout()
-            result.status = "Success"
-            result.file_path = str(saved)
+                sess.logout()
+                result.status = "Success"
+                result.file_path = str(saved)
+
+            except NoDataAvailableError:
+                # normal/expected; no screenshot needed
+                raise
+            except WrongPasswordError:
+                _safe_screenshot(sess, "wrong_password")
+                raise
+            except CaptchaFailedError:
+                _safe_screenshot(sess, "captcha_failed")
+                raise
+            except LoginFailedError:
+                _safe_screenshot(sess, "login_failed")
+                raise
+            except NavigationError:
+                _safe_screenshot(sess, "nav_error")
+                raise
+            except DownloadError:
+                _safe_screenshot(sess, "download_error")
+                raise
+            except PortalError:
+                _safe_screenshot(sess, "portal_error")
+                raise
+            except Exception:
+                _safe_screenshot(sess, "unexpected")
+                raise
 
     except WrongPasswordError as exc:
         result.status = "Wrong Password"
         result.error_reason = str(exc)
         log.error("[%s] WRONG PASSWORD: %s", client.name, exc)
-        _safe_screenshot(sess, "wrong_password")
     except CaptchaFailedError as exc:
         result.status = "CAPTCHA Failed"
         result.error_reason = str(exc)
         log.error("[%s] CAPTCHA FAILED: %s", client.name, exc)
-        _safe_screenshot(sess, "captcha_failed")
     except LoginFailedError as exc:
         result.status = "Failed Login"
         result.error_reason = str(exc)
         log.error("[%s] LOGIN FAILED: %s", client.name, exc)
-        _safe_screenshot(sess, "login_failed")
     except NoDataAvailableError as exc:
         result.status = "No Data Available"
         result.error_reason = str(exc)
@@ -176,22 +198,18 @@ def _process_one(
         result.status = "Portal Error"
         result.error_reason = f"Navigation: {exc}"
         log.error("[%s] NAV ERROR: %s", client.name, exc)
-        _safe_screenshot(sess, "nav_error")
     except DownloadError as exc:
         result.status = "Portal Error"
         result.error_reason = f"Download: {exc}"
         log.error("[%s] DOWNLOAD ERROR: %s", client.name, exc)
-        _safe_screenshot(sess, "download_error")
     except PortalError as exc:
         result.status = "Portal Error"
         result.error_reason = str(exc)
         log.error("[%s] PORTAL ERROR: %s", client.name, exc)
-        _safe_screenshot(sess, "portal_error")
     except Exception as exc:  # noqa: BLE001
         result.status = "Portal Error"
         result.error_reason = f"Unexpected: {exc}"
         log.exception("[%s] UNEXPECTED", client.name)
-        _safe_screenshot(sess, "unexpected")
 
     result.finished_at = datetime.now().strftime("%H:%M:%S")
     return result
