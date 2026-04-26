@@ -107,11 +107,13 @@ a = Analysis(
     hookspath=[],
     runtime_hooks=["runtime_hook.py"],
     excludes=[
+        # Trim very heavy modules we never use to keep the .exe smaller.
+        # NOTE: Do NOT exclude torch.testing or torch.distributions here --
+        # EasyOCR imports torch.testing during initialisation; excluding it
+        # breaks CAPTCHA auto-solve at runtime ("No module named 'torch.testing'").
         "matplotlib",
         "scipy",
         "tkinter.test",
-        "torch.distributions",
-        "torch.testing",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
