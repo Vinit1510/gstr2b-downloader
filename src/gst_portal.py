@@ -541,7 +541,7 @@ class GstSession:
             ) from exc
 
     def open_gstr2b_view(self) -> None:
-        """Click the VIEW button inside the GSTR-2B tile.
+        """Click the View button inside the GSTR-2B card.
 
         The File Returns page shows several cards in a grid:
             - GSTR1   : Details of outward supplies
@@ -550,128 +550,156 @@ class GstSession:
             - GSTR3B  : Monthly Return
             - GSTR2A  : Auto Drafted details (For view only)
 
-        Each card has its own VIEW button. We must click the VIEW button
-        belonging to the GSTR-2B card -- never GSTR1's, GSTR3B's etc.
-
-        Strategy: anchor on the unique subtitle "GSTR2B" inside the GSTR-2B
-        card, walk up to the smallest ancestor element that also contains a
-        VIEW button, then click that button.
+        Important DOM facts (from real portal inspection):
+          * The button HTML text is literally  "View"  (mixed case).
+            The all-caps look comes from CSS `text-transform: uppercase`.
+            Therefore string comparisons MUST be case-insensitive.
+          * Button class is `btn btn-primary` and has the attribute
+            `data-ng-click="page_rtp(x.return_ty,x.due_dt,x.status)"`.
+          * The "GSTR2B" sub-label sits in a SIBLING div, not the button's
+            parent -- so we must walk several ancestors up to find a card
+            that contains BOTH the "GSTR2B" text and the "View" button.
         """
         assert self.page is not None
         page = self.page
-        log.info("Clicking VIEW under GSTR-2B tile (Auto-drafted ITC Statement)...")
+        import re as _re
+        log.info("Clicking View under GSTR-2B card (Auto-drafted ITC Statement)...")
 
         last_err: Exception | None = None
 
-        # ------------------------------------------------------------------
-        # Strategy A: anchor on the exact "GSTR2B" subtitle text and walk up
-        # to the nearest ancestor that contains a VIEW button.  This is the
-        # most reliable approach because "GSTR2B" appears on exactly one tile.
-        # ------------------------------------------------------------------
-        anchor_xpaths = [
-            # Exact "GSTR2B" or "GSTR-2B" sub-label (case-insensitive)
-            ("xpath=//*[normalize-space(translate(text(),"
-             "'abcdefghijklmnopqrstuvwxyz',"
-             "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))='GSTR2B']"),
-            ("xpath=//*[normalize-space(translate(text(),"
-             "'abcdefghijklmnopqrstuvwxyz',"
-             "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))='GSTR-2B']"),
-            # Card title text "Auto - drafted ITC Statement"
-            ("xpath=//*[contains(translate(normalize-space(.),"
-             "'abcdefghijklmnopqrstuvwxyz',"
-             "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),"
-             "'AUTO - DRAFTED ITC STATEMENT')]"),
-            ("xpath=//*[contains(translate(normalize-space(.),"
-             "'abcdefghijklmnopqrstuvwxyz',"
-             "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),"
-             "'AUTO-DRAFTED ITC STATEMENT')]"),
-        ]
-
-        # XPath that finds the closest ancestor that contains a VIEW button
-        # (button OR anchor OR input[value=VIEW]).  Using [1] picks the
-        # SMALLEST such ancestor (the card itself), not the whole page.
-        ancestor_with_view = (
-            "xpath=ancestor::*[ "
-            ".//button[normalize-space(.)='VIEW'] "
-            " or .//a[normalize-space(.)='VIEW'] "
-            " or .//input[translate(@value,"
-            "'abcdefghijklmnopqrstuvwxyz',"
-            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ')='VIEW']"
-            "][1]"
+        # Selector matching the View button across the portal (case-insensitive).
+        view_btn_selector = (
+            "button.btn-primary[data-ng-click*='page_rtp'], "
+            "button.btn.btn-primary, "
+            "button:has-text('View'), "
+            "a:has-text('View')"
         )
-
-        for axp in anchor_xpaths:
-            try:
-                anchor = page.locator(axp).first
-                if not anchor.is_visible(timeout=1500):
-                    continue
-                card = anchor.locator(ancestor_with_view)
-                # Try button, then anchor, then input
-                for view_sel in (
-                    "button:has-text('VIEW')",
-                    "a:has-text('VIEW')",
-                    "input[type='button']",
-                ):
-                    try:
-                        btn = card.locator(view_sel).first
-                        if btn.is_visible(timeout=1000):
-                            btn.scroll_into_view_if_needed(timeout=2000)
-                            btn.click()
-                            log.info(
-                                "VIEW clicked via anchor=%r view_sel=%r",
-                                axp[:60], view_sel,
-                            )
-                            self._wait_for_gstr2b_summary()
-                            return
-                    except Exception as exc:  # noqa: BLE001
-                        last_err = exc
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
+        view_text_re = _re.compile(r"^\s*view\s*$", _re.I)
 
         # ------------------------------------------------------------------
-        # Strategy B: enumerate every VIEW button on the page and pick the
-        # one whose surrounding card also contains the text "GSTR2B".
+        # Strategy A (preferred): use Playwright filter chain to find the
+        # smallest div that contains BOTH the text "GSTR2B" and a View
+        # button.  `.last` returns the deepest (innermost) match -- i.e. the
+        # actual card, not its outer wrapper.
         # ------------------------------------------------------------------
         try:
-            view_btns = page.locator(
-                "button:has-text('VIEW'), a:has-text('VIEW')"
-            )
+            card = page.locator("div").filter(
+                has_text=_re.compile(r"GSTR\s*-?\s*2B", _re.I),
+            ).filter(
+                has=page.locator(view_btn_selector).filter(has_text=view_text_re),
+            ).last
+
+            if card.count() > 0:
+                btn = card.locator(view_btn_selector).filter(
+                    has_text=view_text_re,
+                ).first
+                if btn.is_visible(timeout=3000):
+                    btn.scroll_into_view_if_needed(timeout=2000)
+                    btn.click()
+                    log.info("View clicked via Strategy A (filter chain on GSTR2B card)")
+                    self._wait_for_gstr2b_summary()
+                    return
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            log.debug("Strategy A failed: %s", exc)
+
+        # ------------------------------------------------------------------
+        # Strategy B: enumerate every "View" button on the page; for each,
+        # walk UP the DOM ancestors one by one until we find one whose
+        # text contains "GSTR2B" (and NOT GSTR1/GSTR3B/GSTR2A in the same
+        # immediate sub-text).  That ancestor is the card -> click that
+        # button.
+        # ------------------------------------------------------------------
+        try:
+            view_btns = page.locator(view_btn_selector).filter(has_text=view_text_re)
             count = view_btns.count()
-            log.info("Found %d VIEW button(s) on page; scanning for GSTR-2B card",
-                     count)
+            log.info("Strategy B: found %d 'View' button(s) on page; "
+                     "looking for the one inside the GSTR-2B card", count)
+
             for i in range(count):
                 btn = view_btns.nth(i)
                 try:
-                    # Look at the closest "card-ish" ancestor and check its text
-                    card = btn.locator(
-                        "xpath=ancestor::*[self::div or self::section][1]"
-                    )
-                    text = (card.inner_text(timeout=1500) or "").upper()
-                    if (
-                        "GSTR2B" in text.replace(" ", "").replace("-", "")
-                        or "AUTO - DRAFTED ITC STATEMENT" in text
-                        or "AUTO-DRAFTED ITC STATEMENT" in text
-                    ) and "GSTR1" not in text.split("GSTR2B")[0][-30:]:
-                        # Confirm this card has GSTR2B text (not GSTR1/GSTR3B)
+                    # Walk up to 8 ancestors and inspect their text content.
+                    matched = False
+                    for depth in range(1, 9):
+                        anc = btn.locator(f"xpath=ancestor::*[{depth}]")
+                        if anc.count() == 0:
+                            break
+                        try:
+                            text = (anc.inner_text(timeout=1500) or "").upper()
+                        except Exception:
+                            continue
                         compact = text.replace(" ", "").replace("-", "")
-                        if "GSTR2B" in compact and "GSTR2A" not in compact:
-                            btn.scroll_into_view_if_needed(timeout=2000)
-                            btn.click()
-                            log.info(
-                                "VIEW clicked via Strategy B (card text scan, idx=%d)",
-                                i,
-                            )
-                            self._wait_for_gstr2b_summary()
-                            return
+                        if "GSTR2B" not in compact:
+                            continue
+                        # Reject if this same ancestor also contains another
+                        # return type's label -- means we've gone too far up
+                        # (we're now at a wrapper that holds multiple cards).
+                        other_returns = ("GSTR1", "GSTR1A", "GSTR3B", "GSTR2A")
+                        # Strip GSTR2B occurrences before checking siblings
+                        stripped = compact.replace("GSTR2B", "")
+                        if any(o in stripped for o in other_returns):
+                            continue
+                        # Found the GSTR-2B card.
+                        matched = True
+                        break
+
+                    if matched:
+                        btn.scroll_into_view_if_needed(timeout=2000)
+                        btn.click()
+                        log.info(
+                            "View clicked via Strategy B "
+                            "(button index %d, ancestor depth %d)",
+                            i, depth,
+                        )
+                        self._wait_for_gstr2b_summary()
+                        return
                 except Exception as exc:  # noqa: BLE001
                     last_err = exc
                     continue
         except Exception as exc:  # noqa: BLE001
             last_err = exc
 
+        # ------------------------------------------------------------------
+        # Strategy C: anchor on "GSTR2B" sub-label and walk up to nearest
+        # ancestor that contains ANY View button (case-insensitive XPath).
+        # ------------------------------------------------------------------
+        try:
+            anchor = page.locator(
+                "xpath=//*[contains(translate(normalize-space(.),"
+                "'abcdefghijklmnopqrstuvwxyz',"
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),"
+                "'GSTR2B') or contains(translate(normalize-space(.),"
+                "'abcdefghijklmnopqrstuvwxyz',"
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'GSTR-2B')]"
+            ).last  # the deepest such element is the GSTR2B sub-label
+
+            if anchor.count() > 0:
+                card = anchor.locator(
+                    "xpath=ancestor::*["
+                    ".//button[contains(translate(normalize-space(.),"
+                    "'abcdefghijklmnopqrstuvwxyz',"
+                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VIEW')]"
+                    " or .//a[contains(translate(normalize-space(.),"
+                    "'abcdefghijklmnopqrstuvwxyz',"
+                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VIEW')]"
+                    "][1]"
+                )
+                btn = card.locator(view_btn_selector).filter(
+                    has_text=view_text_re,
+                ).first
+                if btn.is_visible(timeout=2000):
+                    btn.scroll_into_view_if_needed(timeout=2000)
+                    btn.click()
+                    log.info("View clicked via Strategy C (XPath anchor walk-up)")
+                    self._wait_for_gstr2b_summary()
+                    return
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+
         raise NavigationError(
-            "Could not click VIEW under the GSTR-2B (Auto-drafted ITC Statement) "
-            f"tile. Last error: {last_err}"
+            "Could not click View under the GSTR-2B (Auto-drafted ITC Statement) "
+            f"card. Last error: {last_err}"
         )
 
     def _wait_for_gstr2b_summary(self) -> None:
