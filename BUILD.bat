@@ -6,27 +6,29 @@ REM Prerequisite: Python 3.11 64-bit installed and on PATH.
 REM Result: dist\GSTR2B_Downloader.exe
 REM ============================================================
 
-setlocal
+set PYTHON_CMD=python
+python --version >nul 2>&1
+if %errorlevel% neq 0 (
+    set PYTHON_CMD=py
+)
+
 echo.
-echo === [1/5] Creating virtual environment ===
+echo === [1/5] Creating virtual environment (using %PYTHON_CMD%) ===
 if not exist .venv (
-    python -m venv .venv || goto :fail
+    %PYTHON_CMD% -m venv .venv || goto :fail
 )
 call .venv\Scripts\activate || goto :fail
 
 echo.
 echo === [2/5] Installing dependencies (this can take 5-10 min the first time) ===
-python -m pip install --upgrade pip || goto :fail
+%PYTHON_CMD% -m pip install --upgrade pip || goto :fail
 pip install -r requirements.txt || goto :fail
 pip install pyinstaller==6.11.0 || goto :fail
 
 echo.
 echo === [3/5] Downloading bundled Chromium for Playwright ===
-python -m playwright install chromium || goto :fail
+%PYTHON_CMD% -m playwright install chromium || goto :fail
 
-echo.
-echo === [4/5] Pre-downloading EasyOCR English model ===
-python -c "import easyocr; easyocr.Reader(['en'], gpu=False, verbose=False)" || goto :fail
 
 echo.
 echo === [5/5] Building single-file Windows .exe ===

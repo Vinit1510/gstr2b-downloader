@@ -37,8 +37,8 @@ GST_RETURNS_DASHBOARD_URL = (
 )
 
 # Polite-automation timing (seconds)
-HUMAN_DELAY_MIN = 1.5
-HUMAN_DELAY_MAX = 3.5
+HUMAN_DELAY_MIN = 0.1
+HUMAN_DELAY_MAX = 0.3
 PAGE_LOAD_TIMEOUT_MS = 60_000
 ELEMENT_TIMEOUT_MS = 20_000
 
@@ -54,7 +54,6 @@ MONTHS = [
 MONTH_NUMBER = {name: idx for idx, name in enumerate(
     ["January", "February", "March", "April", "May", "June",
      "July", "August", "September", "October", "November", "December"], start=1)}
-
 
 def ensure_dirs() -> None:
     """Create all data folders if missing."""

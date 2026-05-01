@@ -8,30 +8,20 @@
 import os
 import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_all
+from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
-
-# ---------------------------------------------------------------------------
-# Pull in setuptools / pkg_resources internals that PyInstaller misses by
-# default (jaraco.text, jaraco.context, backports.tarfile, etc.).
-# ---------------------------------------------------------------------------
-_pkgres_datas, _pkgres_binaries, _pkgres_hiddenimports = collect_all("pkg_resources")
-_setup_datas, _setup_binaries, _setup_hiddenimports = collect_all("setuptools")
-
-# ---------------------------------------------------------------------------
-# Force-collect every module under our own `src` package so the frozen .exe
-# can resolve `from src.xxx import yyy`.  Without this PyInstaller misses
-# `src` because it is found via path rather than installed as a package.
-# ---------------------------------------------------------------------------
-_src_hiddenimports = collect_submodules("src")
 
 # ---------------------------------------------------------------------------
 # Resolve Playwright browser path so we can bundle it.
 # ---------------------------------------------------------------------------
 def _playwright_browsers_path() -> str:
+    # When `playwright install chromium` runs (in CI we do this before build),
+    # browsers live under the Playwright registry. We grab that and copy it
+    # into the bundle.
     import playwright
     pkg_dir = Path(playwright.__file__).parent
+    # Default Windows registry path
     candidates = [
         Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")) if os.environ.get("PLAYWRIGHT_BROWSERS_PATH") else None,
         Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright",
@@ -55,10 +45,13 @@ datas = []
 for entry in Path(browsers_path).iterdir():
     datas.append((str(entry), f"ms-playwright/{entry.name}"))
 
+# Bundle ddddocr ONNX models
+datas.extend(collect_data_files('ddddocr'))
+
 hiddenimports = [
     "playwright",
     "playwright.sync_api",
-    "easyocr",
+    "ddddocr",
     "customtkinter",
     "openpyxl",
     "cryptography",
@@ -66,53 +59,23 @@ hiddenimports = [
     "PIL.Image",
     "cv2",
     "numpy",
-    # setuptools / pkg_resources tail dependencies (PyInstaller misses these)
-    "pkg_resources",
-    "pkg_resources.extern",
-    "pkg_resources._vendor",
-    "pkg_resources._vendor.jaraco",
-    "pkg_resources._vendor.jaraco.text",
-    "pkg_resources._vendor.jaraco.context",
-    "pkg_resources._vendor.jaraco.functools",
-    "pkg_resources._vendor.backports",
-    "pkg_resources._vendor.backports.tarfile",
-    "jaraco",
-    "jaraco.text",
-    "jaraco.context",
-    "jaraco.functools",
-    "backports",
-    "backports.tarfile",
-    # Our own application package
-    "src",
-    "src.main",
-    "src.config",
-    "src.logger",
-    "src.crypto_utils",
-    "src.excel_io",
-    "src.captcha_solver",
-    "src.gst_portal",
-    "src.orchestrator",
-    "src.gui",
-    "src.gui.main_window",
-    "src.gui.master_password",
-    "src.gui.captcha_dialog",
-] + _pkgres_hiddenimports + _setup_hiddenimports + _src_hiddenimports
+]
 
 a = Analysis(
     ["run.py"],
     pathex=[str(Path(SPECPATH))],
-    binaries=_pkgres_binaries + _setup_binaries,
-    datas=datas + _pkgres_datas + _setup_datas,
+    binaries=[],
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=["runtime_hook.py"],
     excludes=[
-        # Trim very heavy modules we never use to keep the .exe smaller.
-        # NOTE: Do NOT exclude torch.testing or torch.distributions here --
-        # EasyOCR imports torch.testing during initialisation; excluding it
-        # breaks CAPTCHA auto-solve at runtime ("No module named 'torch.testing'").
+        # Trim very heavy modules we never use to keep the .exe smaller
         "matplotlib",
+        "scipy",
         "tkinter.test",
+        "torch.distributions",
+        "torch.testing",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -134,7 +97,7 @@ exe = EXE(
     upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=False,  # GUI app — no console window
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
