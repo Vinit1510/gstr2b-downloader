@@ -385,8 +385,8 @@ class MainWindow(ctk.CTk):
         self._captcha_response = None
         self._captcha_request = (image_bytes, attempt, client_name)
         self._captcha_event.clear()
-        # Wait up to 5 minutes for user
-        ok = self._captcha_event.wait(timeout=300)
+        # Wait up to 30 seconds for user
+        ok = self._captcha_event.wait(timeout=30)
         if not ok:
             return None
         return self._captcha_response
